@@ -1,0 +1,13 @@
+langchain
+langchain-community
+langchain-text-splitters
+faiss-cpu
+sentence-transformers
+rank-bm25
+playwright
+python-dotenv
+requests
+groq
+fastapi
+uvicorn
+pydantic
