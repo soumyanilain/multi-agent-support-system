@@ -84,6 +84,11 @@ class RAGPipeline:
 
         self.bm25 = self.create_bm25_index()
 
+        # Cache query expansions so the evaluation script can compare
+        # dense-only against fusion using identical query sets, and so
+        # repeated questions do not re-hit the LLM rate limit.
+        self._query_cache = {}
+
         print("RAG Pipeline ready.")
 
 
@@ -269,12 +274,19 @@ class RAGPipeline:
 
     # ========================================================
     # QUERY EXPANSION
+    #
+    # Results are cached per question. This keeps the
+    # dense-only and fusion evaluation runs comparable, and
+    # avoids re-spending tokens against the LLM rate limit.
     # ========================================================
 
     def generate_query_variations(
         self,
         question
     ):
+
+        if question in self._query_cache:
+            return self._query_cache[question]
 
         prompt = f"""
 You are helping a technical support system
@@ -357,9 +369,13 @@ USER QUESTION:
                             query
                         )
 
-            return cleaned_queries[
+            variations = cleaned_queries[
                 :NUM_ALTERNATIVE_QUERIES
             ]
+
+            self._query_cache[question] = variations
+
+            return variations
 
         except Exception as error:
 
@@ -368,6 +384,10 @@ USER QUESTION:
                 f"query variations: {error}"
             )
 
+            # Deliberately not cached. A rate limit or network error
+            # is transient, so a later call for the same question
+            # should be allowed to try again. Retrieval still works
+            # using the original question alone.
             return []
 
 
