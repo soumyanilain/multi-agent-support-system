@@ -166,6 +166,11 @@ class RAGPipeline:
 
     # ========================================================
     # CREATE EMBEDDINGS
+    #
+    # Embeddings are L2-normalized so that the FAISS inner
+    # product index returns cosine similarity. This gives a
+    # bounded 0-1 relevance score that the Specialist Agent
+    # can threshold to detect out-of-scope questions.
     # ========================================================
 
     def create_embeddings(self):
@@ -184,6 +189,10 @@ class RAGPipeline:
             "float32"
         )
 
+        faiss.normalize_L2(
+            embeddings
+        )
+
         print(
             "Created embeddings with "
             f"dimension {embeddings.shape[1]}."
@@ -200,7 +209,8 @@ class RAGPipeline:
 
         dimension = self.embeddings.shape[1]
 
-        index = faiss.IndexFlatL2(
+        # Inner product on normalized vectors == cosine similarity.
+        index = faiss.IndexFlatIP(
             dimension
         )
 
@@ -323,6 +333,8 @@ USER QUESTION:
 
     # ========================================================
     # MULTI-QUERY FAISS RETRIEVAL
+    #
+    # Scores are cosine similarities: higher is better.
     # ========================================================
 
     def retrieve_multi_query(
@@ -360,15 +372,19 @@ USER QUESTION:
                 )
             )
 
-            distances, indices = (
+            faiss.normalize_L2(
+                query_embedding
+            )
+
+            scores, indices = (
                 self.index.search(
                     query_embedding,
                     top_k_per_query
                 )
             )
 
-            for distance, index_number in zip(
-                distances[0],
+            for score, index_number in zip(
+                scores[0],
                 indices[0]
             ):
 
@@ -379,20 +395,20 @@ USER QUESTION:
                     index_number
                 )
 
-                distance = float(
-                    distance
+                score = float(
+                    score
                 )
 
                 # If the same chunk is retrieved
                 # by multiple queries, keep the
-                # best distance.
+                # best (highest) similarity.
                 if (
                     index_number
                     not in candidate_chunks
-                    or distance
-                    < candidate_chunks[
+                    or score
+                    > candidate_chunks[
                         index_number
-                    ]["distance"]
+                    ]["score"]
                 ):
 
                     candidate_chunks[
@@ -406,14 +422,15 @@ USER QUESTION:
                             index_number
                         ]["source"],
 
-                        "distance": distance,
+                        "score": score,
 
                         "matched_query": query
                     }
 
         ranked_results = sorted(
             candidate_chunks.values(),
-            key=lambda item: item["distance"]
+            key=lambda item: item["score"],
+            reverse=True
         )
 
         return ranked_results[:final_k]
@@ -437,7 +454,8 @@ USER QUESTION:
                     "No relevant information "
                     "was found in the knowledge base."
                 ),
-                "sources": []
+                "sources": [],
+                "confidence": 0.0
             }
 
         context_parts = []
@@ -585,7 +603,16 @@ KNOWLEDGE BASE CONTEXT:
             "resolution": (
                 validated_response.resolution
             ),
-            "sources": valid_sources
+            "sources": valid_sources,
+
+            # Best cosine similarity across all retrieved
+            # chunks. The Specialist Agent thresholds this
+            # to detect questions the knowledge base does
+            # not cover.
+            "confidence": round(
+                retrieved_results[0]["score"],
+                3
+            )
         }
 
 
@@ -628,10 +655,24 @@ KNOWLEDGE BASE CONTEXT:
 
 
 # ============================================================
-# SINGLE PIPELINE INSTANCE
+# LAZY PIPELINE INSTANCE
+#
+# The pipeline is built on first use rather than at import
+# time, so importing this module does not block on loading
+# the embedding model or fail when no API key is present.
 # ============================================================
 
-rag_pipeline = RAGPipeline()
+_pipeline = None
+
+
+def get_pipeline():
+
+    global _pipeline
+
+    if _pipeline is None:
+        _pipeline = RAGPipeline()
+
+    return _pipeline
 
 
 # ============================================================
@@ -651,8 +692,9 @@ def answer(question):
         category
         resolution
         sources
+        confidence
     """
 
-    return rag_pipeline.answer(
+    return get_pipeline().answer(
         question
     )
