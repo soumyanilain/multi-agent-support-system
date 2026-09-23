@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 
 import faiss
@@ -7,6 +8,7 @@ from dotenv import load_dotenv
 from groq import Groq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, ValidationError
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 
@@ -30,6 +32,10 @@ GROQ_MODEL = os.getenv(
 TOP_K_PER_QUERY = 3
 FINAL_CONTEXT_SIZE = 5
 NUM_ALTERNATIVE_QUERIES = 3
+
+# Reciprocal Rank Fusion smoothing constant. 60 is the value used in
+# the original RRF paper and the common default.
+RRF_K = 60
 
 
 # ============================================================
@@ -75,6 +81,8 @@ class RAGPipeline:
         self.embeddings = self.create_embeddings()
 
         self.index = self.create_faiss_index()
+
+        self.bm25 = self.create_bm25_index()
 
         print("RAG Pipeline ready.")
 
@@ -227,8 +235,40 @@ class RAGPipeline:
 
 
     # ========================================================
-    # ADVANCED RAG:
-    # MULTI-QUERY RETRIEVAL
+    # CREATE BM25 KEYWORD INDEX
+    # ========================================================
+
+    def tokenize(self, text):
+        """Lowercase word tokenizer used by the BM25 index."""
+
+        return re.findall(
+            r"[a-z0-9]+",
+            text.lower()
+        )
+
+
+    def create_bm25_index(self):
+        """Build a BM25 keyword index over the same chunks."""
+
+        tokenized_chunks = [
+            self.tokenize(chunk["text"])
+            for chunk in self.chunks
+        ]
+
+        bm25 = BM25Okapi(
+            tokenized_chunks
+        )
+
+        print(
+            f"BM25 index contains "
+            f"{len(tokenized_chunks)} chunks."
+        )
+
+        return bm25
+
+
+    # ========================================================
+    # QUERY EXPANSION
     # ========================================================
 
     def generate_query_variations(
@@ -332,108 +372,225 @@ USER QUESTION:
 
 
     # ========================================================
-    # MULTI-QUERY FAISS RETRIEVAL
+    # INDIVIDUAL RETRIEVERS
+    # ========================================================
+
+    def dense_ranking(self, query, top_k):
+        """Return chunk indices ranked by cosine similarity."""
+
+        query_embedding = self.embedding_model.encode(
+            [query],
+            convert_to_numpy=True
+        )
+
+        query_embedding = query_embedding.astype(
+            "float32"
+        )
+
+        faiss.normalize_L2(
+            query_embedding
+        )
+
+        scores, indices = self.index.search(
+            query_embedding,
+            top_k
+        )
+
+        ranked = []
+
+        for score, index_number in zip(
+            scores[0],
+            indices[0]
+        ):
+
+            if index_number == -1:
+                continue
+
+            ranked.append(
+                (
+                    int(index_number),
+                    float(score)
+                )
+            )
+
+        return ranked
+
+
+    def bm25_ranking(self, query, top_k):
+        """Return chunk indices ranked by BM25 keyword score."""
+
+        scores = self.bm25.get_scores(
+            self.tokenize(query)
+        )
+
+        ordered = sorted(
+            range(len(scores)),
+            key=lambda i: scores[i],
+            reverse=True
+        )
+
+        ranked = []
+
+        for index_number in ordered[:top_k]:
+
+            if scores[index_number] <= 0:
+                continue
+
+            ranked.append(
+                (
+                    int(index_number),
+                    float(scores[index_number])
+                )
+            )
+
+        return ranked
+
+
+    # ========================================================
+    # ADVANCED RAG:
+    # HYBRID FUSION RETRIEVAL (BM25 + DENSE, MERGED WITH RRF)
     #
-    # Scores are cosine similarities: higher is better.
+    # Dense embeddings capture meaning but blur exact terms.
+    # Support tickets are full of literal tokens -- "Wi-Fi",
+    # "keyboard", "synchronizing" -- that BM25 matches exactly.
+    # Each retriever produces its own ranking and Reciprocal
+    # Rank Fusion merges them by rank position, so neither
+    # retriever's score scale has to be normalized against the
+    # other.
     # ========================================================
 
     def retrieve_multi_query(
         self,
         question,
         top_k_per_query=TOP_K_PER_QUERY,
-        final_k=FINAL_CONTEXT_SIZE
+        final_k=FINAL_CONTEXT_SIZE,
+        use_fusion=True
     ):
+        """
+        Multi-query expansion feeding a hybrid fusion retriever.
 
-        alternative_queries = (
-            self.generate_query_variations(
-                question
-            )
+        The question is rewritten into several alternative phrasings.
+        Each phrasing is run through both a dense retriever and a
+        BM25 retriever, and every resulting ranking is merged with
+        Reciprocal Rank Fusion:
+
+            rrf_score(chunk) = sum over rankings of 1 / (K + rank)
+
+        Setting use_fusion=False falls back to dense-only retrieval,
+        which is how the evaluation script produces a like-for-like
+        comparison between the two strategies.
+        """
+
+        alternative_queries = self.generate_query_variations(
+            question
         )
 
         # Always include the original question.
-        queries = [
-            question
-        ] + alternative_queries
+        queries = [question] + alternative_queries
 
-        candidate_chunks = {}
+        # chunk index -> accumulated RRF score
+        fused_scores = {}
+
+        # chunk index -> best cosine similarity seen, used as the
+        # confidence signal reported to the Specialist Agent.
+        cosine_scores = {}
+
+        # chunk index -> the query phrasing that retrieved it
+        matched_queries = {}
+
+        rankings = []
 
         for query in queries:
 
-            query_embedding = (
-                self.embedding_model.encode(
-                    [query],
-                    convert_to_numpy=True
-                )
+            dense = self.dense_ranking(
+                query,
+                top_k_per_query
             )
 
-            query_embedding = (
-                query_embedding.astype(
-                    "float32"
-                )
+            rankings.append(
+                (query, dense)
             )
 
-            faiss.normalize_L2(
-                query_embedding
-            )
+            for index_number, score in dense:
 
-            scores, indices = (
-                self.index.search(
-                    query_embedding,
+                if (
+                    index_number not in cosine_scores
+                    or score > cosine_scores[index_number]
+                ):
+                    cosine_scores[index_number] = score
+
+            if use_fusion:
+
+                keyword = self.bm25_ranking(
+                    query,
                     top_k_per_query
                 )
-            )
 
-            for score, index_number in zip(
-                scores[0],
-                indices[0]
+                rankings.append(
+                    (query, keyword)
+                )
+
+        # Reciprocal Rank Fusion across every ranking produced.
+        for query, ranking in rankings:
+
+            for rank, (index_number, _score) in enumerate(
+                ranking,
+                start=1
             ):
 
-                if index_number == -1:
-                    continue
-
-                index_number = int(
-                    index_number
+                fused_scores[index_number] = (
+                    fused_scores.get(index_number, 0.0)
+                    + 1.0 / (RRF_K + rank)
                 )
 
-                score = float(
-                    score
+                matched_queries.setdefault(
+                    index_number,
+                    query
                 )
 
-                # If the same chunk is retrieved
-                # by multiple queries, keep the
-                # best (highest) similarity.
-                if (
-                    index_number
-                    not in candidate_chunks
-                    or score
-                    > candidate_chunks[
-                        index_number
-                    ]["score"]
-                ):
+        ranked_indices = sorted(
+            fused_scores,
+            key=lambda i: fused_scores[i],
+            reverse=True
+        )
 
-                    candidate_chunks[
-                        index_number
-                    ] = {
-                        "text": self.chunks[
-                            index_number
-                        ]["text"],
+        results = []
 
-                        "source": self.chunks[
-                            index_number
-                        ]["source"],
+        for index_number in ranked_indices[:final_k]:
 
-                        "score": score,
+            results.append(
+                {
+                    "text": self.chunks[index_number]["text"],
 
-                        "matched_query": query
-                    }
+                    "source": self.chunks[index_number]["source"],
 
-        ranked_results = sorted(
-            candidate_chunks.values(),
+                    # Cosine similarity is kept separately from the
+                    # fusion score because the Specialist Agent
+                    # thresholds it to detect out-of-scope questions.
+                    # BM25-only hits have no cosine score, so they
+                    # contribute nothing to confidence.
+                    "score": cosine_scores.get(index_number, 0.0),
+
+                    "rrf_score": round(
+                        fused_scores[index_number],
+                        5
+                    ),
+
+                    "matched_query": matched_queries.get(
+                        index_number,
+                        question
+                    )
+                }
+            )
+
+        # generate_answer reads results[0]["score"] as the confidence,
+        # so make sure the highest cosine similarity is first.
+        results.sort(
             key=lambda item: item["score"],
             reverse=True
         )
 
-        return ranked_results[:final_k]
+        return results
 
 
     # ========================================================
@@ -622,7 +779,8 @@ KNOWLEDGE BASE CONTEXT:
 
     def answer(
         self,
-        question
+        question,
+        use_fusion=True
     ):
 
         if not isinstance(
@@ -642,10 +800,9 @@ KNOWLEDGE BASE CONTEXT:
                 "Question cannot be empty."
             )
 
-        retrieved_results = (
-            self.retrieve_multi_query(
-                question
-            )
+        retrieved_results = self.retrieve_multi_query(
+            question,
+            use_fusion=use_fusion
         )
 
         return self.generate_answer(
@@ -679,13 +836,15 @@ def get_pipeline():
 # FUNCTION USED BY SERVER.PY
 # ============================================================
 
-def answer(question):
+def answer(question, use_fusion=True):
     """
     Public function used by the Specialist
     A2A server.
 
     Args:
-        question: User's support question.
+        question:   User's support question.
+        use_fusion: False falls back to dense-only retrieval,
+                    used by the evaluation script.
 
     Returns:
         Dictionary containing:
@@ -696,5 +855,6 @@ def answer(question):
     """
 
     return get_pipeline().answer(
-        question
+        question,
+        use_fusion=use_fusion
     )
