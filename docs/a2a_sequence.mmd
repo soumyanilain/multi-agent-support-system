@@ -1,0 +1,53 @@
+sequenceDiagram
+    actor User
+    participant R as Requester Agent
+    participant S as Specialist Agent
+    participant RAG as RAG Pipeline
+    participant LLM as Groq LLM
+    participant PW as Playwright
+
+    User->>R: support request
+
+    R->>S: POST /tasks
+    activate S
+    S-->>R: 202 task_id, status=submitted
+    deactivate S
+
+    Note over S: background task starts
+
+    S->>S: status = working
+
+    S->>RAG: answer(question)
+    RAG->>LLM: expand into 3 query variations
+    LLM-->>RAG: alternative queries
+    RAG->>RAG: dense + BM25 retrieval per query
+    RAG->>RAG: Reciprocal Rank Fusion
+    RAG->>LLM: generate answer from retrieved context
+    LLM-->>RAG: category, resolution, sources
+    RAG-->>S: result + confidence
+
+    loop every 2s, max 30s
+        R->>S: GET /tasks/{task_id}
+        S-->>R: status
+    end
+
+    alt confidence below 0.30
+        S->>S: status = failed
+        Note right of S: insufficient_context
+        R-->>User: rejected, browser never opens
+    else category not in form dropdown
+        S->>S: status = failed
+        Note right of S: unsupported_category
+        R-->>User: rejected, browser never opens
+    else no response within 30s
+        R-->>User: TimeoutError
+    else success
+        S->>S: status = completed
+        S-->>R: result
+        R->>PW: submit_ticket(question, result)
+        PW->>PW: fill issue, category, resolution fields
+        PW->>PW: click submit-ticket button
+        PW->>PW: verify confirmation, read ticket-id
+        PW-->>R: ticket ID
+        R-->>User: ticket submitted
+    end

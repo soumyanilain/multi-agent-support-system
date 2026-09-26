@@ -1,0 +1,56 @@
+flowchart TB
+    U["User request<br/><i>I forgot my password</i>"]
+
+    subgraph REQ["REQUESTER AGENT"]
+        direction TB
+        C["<b>coordinator.py</b><br/>workflow orchestration<br/>error handling"]
+        AC["<b>a2a_client.py</b><br/>submit · poll · timeout<br/>retry with backoff"]
+        BA["<b>browser_agent.py</b><br/>Playwright automation<br/>confirmation check"]
+    end
+
+    subgraph SPEC["SPECIALIST AGENT"]
+        direction TB
+        SV["<b>server.py</b><br/>FastAPI · failure policy<br/>confidence threshold"]
+        TS["<b>task_store.py</b><br/>task registry<br/>status transitions"]
+        RP["<b>rag_pipeline.py</b><br/>retrieval + generation"]
+    end
+
+    subgraph RAG["RAG PIPELINE"]
+        direction LR
+        KB[("knowledge_base/<br/>7 docs · 27 chunks")]
+        FA["FAISS IndexFlatIP<br/>dense · cosine"]
+        BM["BM25Okapi<br/>keyword"]
+        RRF{{"Reciprocal<br/>Rank Fusion"}}
+        LLM["Groq LLM<br/>openai/gpt-oss-20b"]
+        KB --> FA
+        KB --> BM
+        FA --> RRF
+        BM --> RRF
+        RRF --> LLM
+    end
+
+    APP["<b>mock_support_app/index.html</b><br/>#issue · #category · #resolution<br/>#confirmation · #ticket-id"]
+
+    U -->|"1"| C
+    C -->|"2"| AC
+    AC -->|"3 · POST /tasks<br/>GET /tasks/id"| SV
+    SV <-->|"4"| TS
+    SV -->|"5 · background task"| RP
+    RP -->|"6"| KB
+    LLM -->|"7 · category · resolution<br/>sources · confidence"| RP
+    RP -->|"8"| SV
+    SV -->|"9 · grounded result"| AC
+    AC -->|"10"| C
+    C -->|"11 · submit_ticket()"| BA
+    BA <-->|"12 · file:// automation<br/>verify ticket ID"| APP
+
+    classDef agent fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px,color:#1a237e
+    classDef data fill:#e0f2f1,stroke:#00796b,stroke-width:2px,color:#004d40
+    classDef ext fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#e65100
+    class C,AC,BA,SV,TS,RP agent
+    class KB,FA,BM,RRF,LLM data
+    class U,APP ext
+
+    style REQ fill:#fafafa,stroke:#9e9e9e,stroke-width:1px,color:#424242
+    style SPEC fill:#fafafa,stroke:#9e9e9e,stroke-width:1px,color:#424242
+    style RAG fill:#fafafa,stroke:#9e9e9e,stroke-width:1px,color:#424242
